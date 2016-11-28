@@ -1,0 +1,311 @@
+From 61e08eb53fb8d05e66fc62b3bbee238b6e12e1bf Mon Sep 17 00:00:00 2001
+From: Harish S <harisrir@linux.vnet.ibm.com>
+Date: Thu, 13 Oct 2016 18:19:48 +0530
+Subject: [PATCH] Added kernelorg/kernel-build.py file
+
+---
+ kernelorg/kernel-build.py | 292 ++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 292 insertions(+)
+ create mode 100644 kernelorg/kernel-build.py
+
+diff --git a/kernelorg/kernel-build.py b/kernelorg/kernel-build.py
+new file mode 100644
+index 0000000..240c520
+--- /dev/null
++++ b/kernelorg/kernel-build.py
+@@ -0,0 +1,292 @@
++from autotest.client.shared import git, distro, software_manager, error
++from autotest.client import base_utils, kernel
++import os
++import sys
++import logging
++import urlparse
++
++pkgs = software_manager.SoftwareManager()
++dist = distro.detect()
++
++# Some of the global configs
++virt_test_dir = "/home/autotest-jenkins/powerkvm-virt-test"
++cfg_update_str = ""
++test_provider = "qemu"
++test_bucket = "ltc-sanity.cfg"
++host_kernel = None
++patches = 'None'
++
++
++def resolve_deps():
++    '''
++    Install Dependency packages to Setup Build environment
++
++    Checks if packages is already installed else will be installed.
++    Checks if repo is not set then exit the job.
++    TBD : 
++    1. Dynamic deps handling, if build requires any new pkgs to be installed other
++    then listed below, the script should dynamically get the 'command not found error' 
++    and try to install the command.
++    2. If repository is not set: make use of add_repo() in software manager.
++
++    '''
++    # separate list for each distro is maintained, as package name differs
++    # w.r.t distro
++    if dist.name == 'ubuntu':
++        deps = ['gcc', 'git', 'build-essential', 'kexec-tools',
++                'libssl-dev', 'libncurses-dev', 'openssh-server']
++        # the init script /etc/init.d/autotest created by autotest
++        # this script is not LSB compatiblem wich blocks package installation
++        # insert LSB header information ; this requires only for ubuntu
++        utils.system(
++            "sed -i '2i  ### BEGIN INIT INFO' /etc/init.d/autotest", ignore_status=True)
++        utils.system(
++            "sed -i '3i ### END INIT INFO' /etc/init.d/autotest", ignore_status=True)
++        utils.system(
++            "sed -i '2i  ### BEGIN INIT INFO' /etc/rc5.d/S99autotest", ignore_status=True)
++        utils.system(
++            "sed -i '3i ### END INIT INFO' /etc/rc5.d/S99autotest", ignore_status=True)
++
++    elif dist.name == 'ibm_powerkvm':
++        deps = ['gcc', 'git', 'make', 'automake', 'autoconf', 'libtool', 'openssl',
++                'openssl-devel', 'openssl-libs', 'ncurses', 'ncurses-devel', 'ncurses-libs']
++    elif dist.name == 'redhat' or dist.name == 'centos':
++        # TODO : pkgs list to be added for REDHAT
++        deps = ['gcc', 'git', 'make', 'automake', 'autoconf', 'telnet',
++                'kexec-tools', 'libaio', 'libaio-devel', 'openssl',
++                'openssl-devel', 'ncurses', 'ncurses-devel', 'ncurses-libs']
++    elif dist.name == 'sles':
++        deps = ['git-core', 'make', 'automake', 'autoconf', 'telnet', 'ncurses-utils', 'libncurses6', 'kexec-tools', 'libaio', 'libaio-devel', 'openssl', 'openssl-devel']
++        logging.info ("Install required packages for build environment")
++    else:
++        # TODO : pkgs list to be added for Debian
++        raise error.TestError('UnSupported OS!!!')
++
++    i = 0
++    while i < len(deps):
++        print deps[i]
++        if pkgs.install(deps[i]):
++            logging.info("'%s' Package installed successfully!", deps[i])
++        else:
++            raise error.PackageError(
++                "'%s' Not installed! Check for install repository", deps[i])
++            sys.exit(1)
++        i = i + 1
++
++
++def kexec_reboot(kernel):
++
++    # If the kernel has not yet been installed,
++    #   install it now as default tag.
++    if not kernel.installed_as:
++        kernel.install()
++
++    expected_ident = kernel.get_kernel_build_ident()
++    when = int(time.time())
++    kernel.job.next_step_prepend(["job.end_reboot", kernel.subdir,
++                                  expected_ident, "kexec reboot"])
++
++    kernel.job.start_reboot('build')
++    kernel.job.reboot_setup()
++    kernel.job.harness.run_reboot()
++
++    # sync first, so that a sync during shutdown doesn't time out
++    utils.system("sync; sync", ignore_status=True)
++
++    vmlinux = '/boot/vmlinux-' + kernel.installed_as
++    initrd = '/boot/initrd-' + kernel.installed_as
++
++    version = None
++    # FIXME. Without this a kexec reboot will give the below error
++    # Processor 18 is stuck.
++    utils.system("ppc64_cpu --smt=on", ignore_status=True)
++    (status, output) = commands.getstatusoutput('make kernelversion')
++    if os.path.isdir('/lib/modules/' + output + '-autotest+/'):
++        mod_path = '/lib/modules/' + output + '-autotest+/'
++        version = output + '-autotest+'
++    else:
++        mod_path = '/lib/modules/' + output + '-autotest/'
++        version = output + '-autotest'
++    utils.system('find ' + mod_path +
++                 ' -type f -name \'*.ko\' | xargs -n 1 objcopy --strip-unneeded')
++
++    kernel.mkinitrd(version, vmlinux, None, initrd)
++    # Strip initramfs; in case kernel cannot allocate contineous memory blocks
++    logging.info("--- STRIPPING VMLINUX AND INITRD ---")
++    utils.system("cp %s /boot/linux.nonstrip" % (vmlinux))
++    utils.system("cp %s /boot/initrd.nonstrip" % (initrd))
++    utils.system("strip %s" % (vmlinux))
++    utils.system("kexec -l %s --initrd %s -e -f --append=rw" %
++                 (vmlinux, initrd))
++    kernel.job.quit()
++
++
++def kernel_build(host_kernel, host_kernel_branch, patches, config_dir):
++    logging.info("TEST: downloading/unpacking kernel")
++    logging.info("TEST: kernel git repo [%s] kernel branch [%s]",
++                 host_kernel, host_kernel_branch)
++    if os.path.exists('/root/hostCopy.tar.gz'):
++        if os.path.exists('/home/linux_src'):
++            print 'Removing existing tar'
++            utils.system('rm -rf /home/linux_src/*')
++        else:
++            os.makedirs('/home/linux_src')
++            print 'Creating source directory'   
++        print 'UNTARRING SOURCE'
++        utils.system(
++            'tar -C /home/linux_src -xzf /root/hostCopy.tar.gz hostCopy --strip-components=1')
++        repodir = '/home/linux_src/'
++    else:
++        if os.path.exists('/home/linux_src'):
++            print 'Removing existing tar'
++            utils.system('rm -rf /home/linux_src/*')
++        else:
++            print 'Creating source directory'
++            os.makedirs('/home/linux_src')
++        repodir = git.get_repo(uri=host_kernel, branch=host_kernel_branch,
++                               destination_dir="/home/linux_src/")
++
++    testkernel = job.kernel(repodir)
++
++    # handling a series of patche files given as input seperated by commas
++    if patches != 'None':
++        logging.info("TEST: patching kernel")
++        print patches
++        patch_list = []
++        for patch in patches.split(','):
++            patch = '/root/' + patch
++            patch_list.append(patch)
++        testkernel.patch(*patch_list)
++
++    logging.info("TEST: configuring kernel")
++    # Multiple config file is not supported
++    # config_dir is configfile name input, if user uploads config file, trigger.py will scpied to /home/userconfig/ folder
++    # if no config file uploaded, build with default distro config
++    # if config_dir is http url path to config file
++    # if config_dir is 'make <givenconfig>' like make pseries_le_defconfig
++    config_file = '/root/' + config_dir
++    url = parts = urlparse.urlsplit(config_dir)
++
++    if os.path.isfile(config_file):
++        logging.info("config file found at %s" % config_file)
++        testkernel.config(config_file)
++
++    elif url.scheme or url.netloc:
++        logging.info("Downloading the kernel config from %s" % config_dir)
++        utils.get_file(config_dir, repodir + '/.config')
++        os.chdir(repodir)
++        utils.system('yes "" | make olddefconfig')
++
++    elif 'make' in config_dir:
++        logging.info("making with given config %s" % config_dir)
++        os.chdir(repodir)
++        config_dir = config_dir[1:-1]
++        utils.system("%s" % (config_dir))
++
++    else:
++        version = os.uname()[2]
++        configfile = '/boot/config-%s' % version
++        if os.path.isfile(configfile):
++            logging.info("No config file uploaded, using default base config")
++            logging.info("Copying the kernel config from %s" % configfile)
++            utils.get_file(configfile, repodir + '/.config')
++        os.chdir(repodir)
++        utils.system('yes "" | make oldconfig')
++
++    logging.info("TEST: building kernel")
++    testkernel.build()
++
++    logging.info("TEST: install kernel")
++    testkernel.install()
++
++    return testkernel
++
++
++def virttest_run():
++    logging.info("TEST: running virttest with test bucket %s" % test_bucket)
++    sys.path.insert(0, virt_test_dir)
++    from virttest import utils_misc, cartesian_config, data_dir, bootstrap, arch
++
++    parser = cartesian_config.Parser()
++    cfg_path = data_dir.get_backend_cfg_path(test_provider, test_bucket)
++    parser.parse_file(cfg_path)
++    # We can overload few dict values
++    parser.parse_string(cfg_update_str)
++
++    # disable smt
++    utils.system("ppc64_cpu --smt=off", ignore_status=True)
++    utils_misc.run_tests(parser, job)
++
++
++def hosttest_run(tests):
++    # By default only build kernel and do not run any tests after boot i.e tests = None always
++    # Unless user specifies any tests like tests = 'dbench', then we will
++    # build and run tests.
++    if tests != None:
++        logging.info("TEST: running host test")
++        tests = tests[1:-1]
++        tests = tests.split(',')
++        for component in tests:
++            logging.info("Test: running %s tests" % component)
++            print component
++            if (' ' in component) == True:
++                print "Running with args"
++                ags = ' '.join(component.split()[1:])
++                print ags
++                job.run_test(' '.join(component.split()[:1]), args=ags)
++            else:
++                job.run_test(component)
++    else:
++        logging.info("No tests to run. Proceeding to Copy")
++
++
++def test_run(tests):
++    hosttest_run(tests)
++    # virttest_run()
++
++
++def step_init():
++    resolve_deps()
++    if not host_kernel:
++        test_run()
++
++    else:
++        testkernel = job.run_group(function=kernel_build, patches=patches,
++                                   config_dir=config_dir,
++                                   host_kernel=host_kernel,
++                                   host_kernel_branch=host_kernel_branch)
++        if testkernel:
++            if host_tests == None:
++                logging.info("TEST: Kernel Building Complete")
++            else:
++                logging.info("TEST: installing and booting the kernel")
++                job.next_step([test_run, host_tests])
++                kexec_reboot(testkernel)
++
++# We have host kernel specified. If so We need to build the kernel
++# and run virt_test with the newly built kernel.
++if args:
++    # We get test parameters from command line
++    for arg in args:
++        try:
++            host_tests = None
++            (key, value) = re.findall("^(\w+)=(.*)", arg)[0]
++            if key == "host_kernel":
++                host_kernel = value
++            elif key == "host_kernel_branch":
++                host_kernel_branch = value
++            elif key == "config_dir":
++                config_dir = value
++            elif key == "patches":
++                patches = value
++            elif key == "test_bucket":
++                test_bucket = value
++            elif key == "virt_test_dir":
++                virt_test_dir = value
++            elif key == "tests":
++                host_tests = value
++            else:
++                # update for cartesian configs
++                cfg_update_str += "%s = %s\n" % (key, value)
++        except IndexError:
++            pass
+-- 
+1.9.1
+
